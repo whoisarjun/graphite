@@ -1,0 +1,8 @@
+pillow~=11.2.1
+numpy~=2.2.6
+scipy~=1.15.3
+tqdm~=4.67.1
+torch~=2.7.0
+torchvision~=0.22.0
+sympy~=1.14.0
+timm~=0.5.4
