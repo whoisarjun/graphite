@@ -1,16 +1,6 @@
-import os
+import image_processor as ip
+from graphite import Graphite
 
-def count_pngs_in_cleaned_data():
-    root_folder = './CLEANED_DATA'
-    png_count = 0
-
-    for dirpath, dirnames, filenames in os.walk(root_folder):
-        for file in filenames:
-            if file.lower().endswith('.png'):
-                png_count += 1
-
-    print(f"Total .png files in '{root_folder}': {png_count}")
-    return png_count
-
-# Call the function
-count_pngs_in_cleaned_data()
+model = Graphite(model_path='graphite_test_val.pt')
+ip.process('Screenshot.png', 'output.png')
+print(model.predict('output.png'))

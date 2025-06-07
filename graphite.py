@@ -60,19 +60,17 @@ class Graphite:
     def __init__(self, model_path='graphite.pt', device=None):
         self.device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 
-        # Load checkpoint
         checkpoint = torch.load(model_path, map_location=self.device)
         tokenizer_vocab = checkpoint['tokenizer']
 
-        # Init tokenizer with vocab from checkpoint
         self.tokenizer = LatexTokenizer()
         self.tokenizer.token_to_id = tokenizer_vocab
         self.tokenizer.id_to_token = {v: k for k, v in tokenizer_vocab.items()}
 
         vocab_size = len(tokenizer_vocab)
 
-        # Build encoder and decoder
-        self.encoder = EncoderCNN(output_dim=256).to(self.device)
+        from create_model import EncoderViT
+        self.encoder = EncoderViT(output_dim=256).to(self.device)
         self.decoder = TransformerDecoder(
             vocab_size=vocab_size,
             encoder_dim=256,
@@ -83,14 +81,17 @@ class Graphite:
             max_len=256
         ).to(self.device)
 
-        self.encoder.load_state_dict(checkpoint['encoder_state_dict'])
+        # Load encoder state dict with strict=False to allow missing keys
+        missing_keys, unexpected_keys = self.encoder.load_state_dict(checkpoint['encoder_state_dict'], strict=False)
+        if 'type_embed.weight' in missing_keys:
+            # Manually initialize type_embed.weight if missing
+            nn.init.normal_(self.encoder.type_embed.weight, mean=0.0, std=0.02)
+
         self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
         self.encoder.eval()
         self.decoder.eval()
 
-        # Image preprocessing pipeline: grayscale, resize, normalize (matches training)
         self.transform = transforms.Compose([
-            transforms.Grayscale(num_output_channels=1),
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])
