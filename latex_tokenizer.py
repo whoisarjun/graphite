@@ -27,27 +27,30 @@ class LatexTokenizer:
         self.token_to_id = {}
         self.id_to_token = {}
 
-    def build_vocab(self, latex_list):
-        # Note: You may consider preprocessing tokens to unify forms (e.g., normalizing curly brackets) or handling token merges here if needed
+    def build_vocab(self, latex_list, tree_tokens=None):
         token_set = set()
+
         for latex in latex_list:
             tokens = _tokenize(latex)
             token_set.update(tokens)
 
-            # Normalize tokens to handle common LaTeX variations
-            normalized_tokens = []
+            # Normalize tokens
             for token in tokens:
                 if token == '{':
-                    normalized_tokens.append('LEFTBRACE')
+                    token_set.add('LEFTBRACE')
                 elif token == '}':
-                    normalized_tokens.append('RIGHTBRACE')
-                else:
-                    normalized_tokens.append(token)
-            token_set.update(normalized_tokens)
+                    token_set.add('RIGHTBRACE')
+
+        if tree_tokens:
+            token_set.update(tree_tokens)
+
+        for i in range(20):  # or go higher if needed
+            token_set.add(str(i))
 
         full_vocab = self.special_tokens + sorted(token_set)
         self.token_to_id = {token: idx for idx, token in enumerate(full_vocab)}
         self.id_to_token = {idx: token for token, idx in self.token_to_id.items()}
+        self.pad_token_id = self.token_to_id['<PAD>']
 
     def encode(self, latex_str):
         tokens = _tokenize(latex_str)
@@ -66,7 +69,7 @@ class LatexTokenizer:
         tokens = [t for t in tokens if t not in ['<SOS>', '<EOS>', '<PAD>']]
         return ' '.join(tokens)
 
-    def tokenize_raw(self, latex_str):
+    def tokenize(self, latex_str):
         tokens = _tokenize(latex_str)
         normalized = []
         for token in tokens:

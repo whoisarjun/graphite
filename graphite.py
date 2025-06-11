@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
-from create_model import EncoderCNN, TransformerDecoder, LatexTokenizer  # adjust imports if needed
+from create_model import EncoderViT, TransformerDecoder, LatexTokenizer
 
 import re
 

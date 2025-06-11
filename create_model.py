@@ -1,25 +1,29 @@
+# Things to sort out:
+# why vit_base_patch16_256? does this rlly work in this use case?
+
+
 import json
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split, Sampler
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from transformers import CLIPModel
 from torch import nn
 from dataset import MathDataset
 from latex_tokenizer import LatexTokenizer
-from sympy.parsing.latex import parse_latex
-from sympy.core.sympify import SympifyError
-from tqdm import tqdm
-from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
-import timm
 
-BATCH_SIZE = 16
-CORES = 16
-TOTAL_EPOCHS = 25
-JSON_PATH = 'val.json'
-PT_SAVE = 'graphite_test_val.pt'
+BATCH_SIZE = 4
+CORES = 1
+TOTAL_EPOCHS = 30
+PT_SAVE = 'graphite.pt'
+
+TRAIN_JSON = './datasets/train.json'
+TEST_JSON = './datasets/test.json'
+VAL_JSON = './datasets/val.json'
 
 def collate_fn(batch):
     # Unpack batch: (img, tokens, type_id)
-    imgs, token_lists, type_ids = zip(*batch)
+    imgs, token_lists, type_ids, latex_strs = zip(*batch)
     imgs = torch.stack(imgs, dim=0)  # stack images (all same size)
     lengths = [len(t) for t in token_lists]
     max_length = max(lengths)
@@ -28,188 +32,80 @@ def collate_fn(batch):
         end = lengths[j]
         padded_tokens_[j, :end] = tokens if isinstance(tokens, torch.Tensor) else torch.tensor(tokens, dtype=torch.long)
     type_ids_tensor = torch.tensor(type_ids, dtype=torch.long)
-    return imgs, padded_tokens_, lengths, type_ids_tensor
+    return imgs, padded_tokens_, lengths, type_ids_tensor, latex_strs
 
 class EncoderViT(nn.Module):
-    def __init__(self, output_dim=256, model_name='vit_base_patch16_224', pretrained=True):
+    def __init__(self, output_dim=256, model_name='openai/clip-vit-large-patch14'):
         super().__init__()
-        self.vit = timm.create_model(model_name, pretrained=pretrained, img_size=224, num_classes=0)
-        self.patch_embed = self.vit.patch_embed  # Patch embedding module
-        self.pos_embed = self.vit.pos_embed      # Positional embeddings
-        self.cls_token = self.vit.cls_token      # CLS token
-        self.blocks = self.vit.blocks            # Transformer encoder blocks
-        self.norm = self.vit.norm                # Layer norm
+        self.model = CLIPModel.from_pretrained(model_name)
+
+        for param in self.model.vision_model.parameters():
+            param.requires_grad = False
+
         self.output_dim = output_dim
-        self.proj = nn.Linear(self.vit.embed_dim, output_dim)
-        # Add type embedding for 'symbol' and 'complete'
-        self.type_embed = nn.Embedding(2, self.vit.embed_dim)
-        self.resize_pos_embed(new_img_size=224, patch_size=16)
+        self.proj = nn.Linear(self.model.vision_model.config.hidden_size, output_dim)
 
-    def resize_pos_embed(self, new_img_size=224, patch_size=16):
-        num_patches = (new_img_size // patch_size) ** 2
-        cls_token = self.cls_token
-        pos_embed = self.pos_embed[:, 1:, :]  # remove CLS token
-        B, N, D = pos_embed.shape
+        self.type_embed = nn.Embedding(2, self.model.vision_model.config.hidden_size)
 
-        old_size = int(N ** 0.5)
-        new_size = int(num_patches ** 0.5)
-
-        pos_embed = pos_embed.reshape(1, old_size, old_size, D).permute(0, 3, 1, 2)
-        pos_embed = torch.nn.functional.interpolate(pos_embed, size=(new_size, new_size), mode='bilinear')
-        pos_embed = pos_embed.permute(0, 2, 3, 1).reshape(1, new_size * new_size, D)
-
-        self.pos_embed = nn.Parameter(torch.cat([cls_token, pos_embed], dim=1))
-
-    # Accept type_ids tensor, add corresponding embedding to patch embeddings before positional embedding
-    def forward(self, x, type_ids=None):
-        B = x.size(0)
-        x = self.patch_embed(x)  # (B, num_patches, embed_dim)
+    def forward(self, images, type_ids=None):
         if type_ids is not None:
-            # Add type embedding for each sample in the batch (0: symbol, 1: complete)
-            type_embedding = self.type_embed(type_ids).unsqueeze(1)  # (B, 1, embed_dim)
-            x = x + type_embedding  # broadcast add
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, embed_dim)
-        x = torch.cat((cls_tokens, x), dim=1)  # (B, 1 + num_patches, embed_dim)
-        x = x + self.pos_embed
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-        x = self.proj(x)  # (B, seq_len, output_dim)
-        return x  # (batch_size, seq_len, output_dim)
+            type_embedding = self.type_embed(type_ids).unsqueeze(1)
+        else:
+            type_embedding = 0
 
-class Attention(nn.Module):
-    def __init__(self, encoder_dim, decoder_dim, attention_dim):
-        super().__init__()
-        self.encoder_att = nn.Linear(encoder_dim, attention_dim)  # encoder features to attention space
-        self.decoder_att = nn.Linear(decoder_dim, attention_dim)  # decoder hidden to attention space
-        self.full_att = nn.Linear(attention_dim, 1)               # combined to scalar score
-        self.relu = nn.ReLU()
-        self.softmax = nn.Softmax(dim=1)
+        vision_outputs = self.model.vision_model(pixel_values=images, output_hidden_states=True)
+        last_hidden = vision_outputs.hidden_states[-1]
 
-    def forward(self, encoder_out, decoder_hidden):
-        att1 = self.encoder_att(encoder_out)             # [B, N, attention_dim]
-        att2 = self.decoder_att(decoder_hidden)          # [B, attention_dim]
-        att = self.full_att(self.relu(att1 + att2.unsqueeze(1))).squeeze(2)  # [B, N]
-        alpha = self.softmax(att)                         # attention weights
-        context = (encoder_out * alpha.unsqueeze(2)).sum(dim=1)  # weighted sum context vector
-        return context, alpha
+        if isinstance(type_embedding, torch.Tensor):
+            last_hidden = last_hidden + type_embedding
 
-class TransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, encoder_dim=256, embed_dim=256, num_heads=8, num_layers=6, dropout=0.1, max_len=256):
+        x = self.proj(last_hidden)
+        return x
+
+class TamerDecoder(nn.Module):
+    def __init__(self, vocab_size, embed_dim=256, dropout=0.1, max_len=256):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_len, embed_dim))
-        decoder_layer = nn.TransformerDecoderLayer(embed_dim, num_heads, dim_feedforward=2048, dropout=dropout, batch_first=True)
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers)
-        self.fc = nn.Linear(embed_dim, vocab_size)
+        self.pos_embed = nn.Parameter(torch.randn(1, max_len, embed_dim))
         self.dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(embed_dim, embed_dim, batch_first=True)
+        self.fc = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, encoder_outputs, tgt_seq, tgt_mask=None):
-        seq_len = tgt_seq.size(1)
-        tgt_emb = self.embed(tgt_seq) + self.pos_embed[:, :seq_len, :]
-        tgt_emb = self.dropout(tgt_emb)
-        output = self.transformer_decoder(tgt_emb, encoder_outputs, tgt_mask=tgt_mask)
-        logits = self.fc(output)
+    def forward(self, encoder_out, tgt_seq, tgt_mask=None):
+        B, T = tgt_seq.shape
+        x = self.embed(tgt_seq) + self.pos_embed[:, :T, :]
+        x = self.dropout(x)
+        x, _ = self.gru(x)
+        logits = self.fc(x)
         return logits
 
-with open(JSON_PATH, 'r', encoding='utf-8') as f:
-    raw_data = json.load(f)
-latex_list = [pair['latex'] for pair in raw_data['pairs'] if pair.get('latex') is not None]
+with open(TRAIN_JSON, 'r', encoding='utf-8') as f:
+    train_data = json.load(f)
+
+with open(TEST_JSON, 'r', encoding='utf-8') as f:
+    test_data = json.load(f)
+
+with open(VAL_JSON, 'r', encoding='utf-8') as f:
+    val_data = json.load(f)
+
+train_latex = [pair['latex'] for pair in train_data['pairs'] if pair.get('latex') is not None]
+val_latex = [pair['latex'] for pair in val_data['pairs'] if pair.get('latex') is not None]
+test_latex = [pair['latex'] for pair in test_data['pairs'] if pair.get('latex') is not None]
+
+all_latex = train_latex + val_latex + test_latex
 
 tokenizer = LatexTokenizer()
-tokenizer.build_vocab(latex_list)
+tokenizer.build_vocab(all_latex)
 
-class MathDatasetWithType(MathDataset):
-    """
-    Extension of MathDataset to return (img, tokens, type_id) where type_id is 0 for 'symbol', 1 for 'complete'.
-    """
-    def __getitem__(self, idx):
-        img, tokens = super().__getitem__(idx)
-        type_str = self.get_type(idx)
-        type_id = 0 if type_str == 'symbol' else 1
-        return img, tokens, type_id
-
-# Dataset + DataLoader
-dataset = MathDatasetWithType(JSON_PATH, tokenizer)
-
-class BalancedBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        # Group indices by 'type'
-        self.symbol_indices = []
-        self.complete_indices = []
-        for idx in range(len(dataset)):
-            item_type = dataset.get_type(idx)  # Assuming MathDataset has get_type method returning 'symbol' or 'complete'
-            if item_type == 'symbol':
-                self.symbol_indices.append(idx)
-            elif item_type == 'complete':
-                self.complete_indices.append(idx)
-            else:
-                # If other types exist, ignore or handle accordingly
-                pass
-        self.symbol_pos = 0
-        self.complete_pos = 0
-        self.num_batches = len(dataset) // batch_size
-
-        # Shuffle indices initially
-        self._shuffle_indices()
-
-    def _shuffle_indices(self):
-        import random
-        random.shuffle(self.symbol_indices)
-        random.shuffle(self.complete_indices)
-        self.symbol_pos = 0
-        self.complete_pos = 0
-
-    def __iter__(self):
-        self._shuffle_indices()
-        batches = []
-        half_batch = self.batch_size // 2
-        for _ in range(self.num_batches):
-            batch = []
-            # Sample half batch from symbol_indices
-            for _ in range(half_batch):
-                if self.symbol_pos >= len(self.symbol_indices):
-                    self.symbol_pos = 0
-                    import random
-                    random.shuffle(self.symbol_indices)
-                batch.append(self.symbol_indices[self.symbol_pos])
-                self.symbol_pos += 1
-            # Sample half batch from complete_indices
-            for _ in range(half_batch):
-                if self.complete_pos >= len(self.complete_indices):
-                    self.complete_pos = 0
-                    import random
-                    random.shuffle(self.complete_indices)
-                batch.append(self.complete_indices[self.complete_pos])
-                self.complete_pos += 1
-            batches.append(batch)
-        # If batch_size is odd, fill last slot from either group
-        if self.batch_size % 2 != 0:
-            # Add one more sample from symbol_indices if available else complete_indices
-            if self.symbol_pos < len(self.symbol_indices):
-                batches[-1].append(self.symbol_indices[self.symbol_pos])
-                self.symbol_pos += 1
-            elif self.complete_pos < len(self.complete_indices):
-                batches[-1].append(self.complete_indices[self.complete_pos])
-                self.complete_pos += 1
-        for batch in batches:
-            yield batch
-
-    def __len__(self):
-        return self.num_batches
-
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=CORES)
+train_dataset = MathDataset(TRAIN_JSON, tokenizer)
+val_dataset = MathDataset(VAL_JSON, tokenizer)
+test_dataset = MathDataset(TEST_JSON, tokenizer)
 
 # Build encoder and decoder
 encoder = EncoderViT(output_dim=256)
-decoder = TransformerDecoder(
+decoder = TamerDecoder(
     vocab_size=len(tokenizer.token_to_id),
-    encoder_dim=256,
     embed_dim=256,
-    num_heads=8,
-    num_layers=6,
     dropout=0.1,
     max_len=256
 )
@@ -218,28 +114,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.ba
 encoder = encoder.to(device)
 decoder = decoder.to(device)
 
-class LabelSmoothingLoss(nn.Module):
-    def __init__(self, smoothing=0.1):
-        super().__init__()
-        self.smoothing = smoothing
-
-    def forward(self, pred, target):
-        confidence = 1.0 - self.smoothing
-        log_prob = nn.functional.log_softmax(pred, dim=-1)
-        nll_loss = -log_prob.gather(dim=-1, index=target.unsqueeze(1)).squeeze(1)
-        smooth_loss = -log_prob.mean(dim=-1)
-        loss = confidence * nll_loss + self.smoothing * smooth_loss
-        return loss.mean()
-
-criterion = LabelSmoothingLoss(smoothing=0.1)
+criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
 
 optimizer = optim.Adam(
     list(encoder.parameters()) +
     list(decoder.parameters()),
-    lr=1e-4
+    lr=1e-6
 )
-# NOTE: CrossEntropyLoss may not capture semantic errors (e.g., missing terms or wrong structure)
-# Consider evaluating with sequence-level metrics like BLEU or edit distance in addition to CrossEntropy
 
 def decode_predictions(preds, tokenizer):
     pred_tokens = preds.argmax(dim=-1)
@@ -247,54 +128,22 @@ def decode_predictions(preds, tokenizer):
     # TIP: You can add a sanity check here to compare decoded output with valid LaTeX via sympy
     return decoded
 
-def validate_math_expression(latex_str):
-    try:
-        expr = parse_latex(latex_str)
-        return True, expr
-    except (SympifyError, Exception):
-        return False, None
-
-# Compare two LaTeX expressions using SymPy's expression trees for structural equivalence
-def expressions_match(latex_pred, latex_gt):
-    try:
-        expr_pred = parse_latex(latex_pred)
-        expr_gt = parse_latex(latex_gt)
-        return expr_pred.equals(expr_gt)
-    except Exception:
-        return False
-
-# Consider using math expression validation during training as an auxiliary loss or evaluation metric
-
-class SubsetWithGetType(torch.utils.data.Dataset):
-    def __init__(self, original_dataset, indices):
-        self.dataset = original_dataset
-        self.indices = indices
-    def __len__(self):
-        return len(self.indices)
-    def __getitem__(self, idx):
-        return self.dataset[self.indices[idx]]
-    def get_type(self, idx):
-        return self.dataset.get_type(self.indices[idx])
-
-
 def create():
     print('Getting started...')
 
-    val_size = int(0.1 * len(dataset))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(
+        train_dataset, collate_fn=collate_fn, num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8
+    )
 
-    # Create BalancedBatchSampler for train_dataset
-    # Need to map indices in train_dataset back to original dataset indices
-    train_indices = train_dataset.indices if hasattr(train_dataset, 'indices') else list(range(train_size))
-    train_subset = SubsetWithGetType(dataset, train_indices)
+    val_loader = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn,
+        num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8
+    )
 
-    train_sampler = BalancedBatchSampler(train_subset, batch_size=BATCH_SIZE)
-
-    train_loader = DataLoader(train_subset, batch_sampler=train_sampler, collate_fn=collate_fn,
-                              num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn,
-                            num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8)
+    test_loader = DataLoader(
+        test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn,
+        num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8
+    )
 
     # Enable cuDNN autotuner and AMP
     torch.backends.cudnn.benchmark = True
@@ -311,7 +160,9 @@ def create():
         decoder.train()
         running_loss = 0.0
         # Training loop: extract type_ids from batch and pass to encoder
-        for images, padded_tokens, lengths, type_ids in tqdm(train_loader):
+        for images, padded_tokens, lengths, type_ids, latex_strs in tqdm(train_loader):
+            for i, latex in enumerate(latex_strs):
+                print(f"Sample {i} LaTeX: {latex} | Token length: {lengths[i]}")
             images = images.to(device, non_blocking=True)
             padded_tokens = padded_tokens.to(device, non_blocking=True)
             lengths = torch.tensor(lengths).to(device, non_blocking=True)
@@ -324,13 +175,67 @@ def create():
                 # Pass type_ids to encoder for type embedding
                 encoder_out = encoder(images, type_ids=type_ids)
                 seq_len = padded_tokens.size(1) - 1
+                if seq_len <= 0:
+                    print("[WARNING] Zero or negative sequence length encountered. Applying zero-length padding fix.")
+                    padded_tokens = torch.cat(
+                        [padded_tokens,
+                         torch.full((padded_tokens.size(0), 1), tokenizer.pad_token_id, device=padded_tokens.device)],
+                        dim=1
+                    )
+                    seq_len = padded_tokens.size(1) - 1
                 tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
                 predictions = decoder(encoder_out, padded_tokens[:, :-1], tgt_mask=tgt_mask)
+
+                # --- SANITY CHECKS ---
+                # Check for NaN or Inf in predictions
+                if torch.isnan(predictions).any() or torch.isinf(predictions).any():
+                    print("[WARNING] NaN or Inf detected in predictions.")
+                    print(f"predictions shape: {predictions.shape}")
+                    print(f"images shape: {images.shape}")
+                    print(f"padded_tokens shape: {padded_tokens.shape}")
+                    print(f"seq_len: {seq_len}")
+                    raise RuntimeError(f"Sanity check failed: NaN or Inf in predictions (shape: {predictions.shape})")
+                # Check for NaN or Inf in targets
                 targets = padded_tokens[:, 1:].reshape(-1)
+                if torch.isnan(targets.float()).any() or torch.isinf(targets.float()).any():
+                    print("[WARNING] NaN or Inf detected in targets.")
+                    print(f"targets shape: {targets.shape}")
+                    raise RuntimeError(f"Sanity check failed: NaN or Inf in targets (shape: {targets.shape})")
+                # Print shapes
+                print(f"[Sanity] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+                # Check seq_len
+                if seq_len <= 0:
+                    print("[WARNING] seq_len is not greater than zero after fix.")
+                    raise RuntimeError(f"Sanity check failed: seq_len <= 0 (seq_len: {seq_len})")
+                print(f"[Sanity] seq_len: {seq_len}")
+                # Check padded_tokens slicing shapes
+                if padded_tokens[:, :-1].shape[1] != seq_len or padded_tokens[:, 1:].shape[1] != seq_len:
+                    print("[WARNING] padded_tokens slicing shapes are invalid.")
+                    print(f"padded_tokens[:, :-1].shape: {padded_tokens[:, :-1].shape}")
+                    print(f"padded_tokens[:, 1:].shape: {padded_tokens[:, 1:].shape}")
+                    raise RuntimeError(f"Sanity check failed: Invalid shapes for padded_tokens slices (got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
+
+                # Additional check: print unique target tokens before loss calculation
+                unique_targets = torch.unique(targets)
+                print(f"[Sanity] Unique target tokens before loss: {unique_targets.tolist()}")
+                # Additional check: check for extreme values in predictions
+                if (predictions > 1e4).any() or (predictions < -1e4).any():
+                    print("[ERROR] Extreme value detected in predictions (>1e4 or <-1e4).")
+                    print(f"Max prediction: {predictions.max().item()}, Min prediction: {predictions.min().item()}")
+                    raise RuntimeError("Sanity check failed: Extreme value in predictions (>1e4 or <-1e4).")
+
                 preds = predictions.reshape(-1, predictions.size(-1))
                 decoder_loss = criterion(preds, targets)
 
+            # NaN loss check
+            if torch.isnan(decoder_loss):
+                print("[WARNING] NaN in loss. Exiting with error.")
+                raise RuntimeError("NaN in loss.")
+
             scaler.scale(decoder_loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(encoder.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -345,7 +250,9 @@ def create():
         val_loss = 0.0
         predictions_accum = []
         with torch.no_grad():
-            for images, padded_tokens, lengths, type_ids in val_loader:
+            for images, padded_tokens, lengths, type_ids, latex_strs in tqdm(train_loader):
+                for i, latex in enumerate(latex_strs):
+                    print(f"[VAL] Sample {i} LaTeX: {latex} | Token length: {lengths[i]}")
                 images = images.to(device)
                 padded_tokens = padded_tokens.to(device)
                 lengths = torch.tensor(lengths).to(device)
@@ -355,13 +262,52 @@ def create():
                 encoder_out = encoder(images, type_ids=type_ids)
 
                 seq_len = padded_tokens.size(1) - 1
+                if seq_len <= 0:
+                    print("[WARNING] Zero or negative sequence length encountered in validation. Applying zero-length padding fix.")
+                    padded_tokens = torch.cat(
+                        [padded_tokens,
+                         torch.full((padded_tokens.size(0), 1), tokenizer.pad_token_id, device=padded_tokens.device)],
+                        dim=1
+                    )
+                    seq_len = padded_tokens.size(1) - 1
                 tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
-
                 predictions = decoder(encoder_out, padded_tokens[:, :-1], tgt_mask=tgt_mask)
+
+                # --- SANITY CHECKS (Validation) ---
+                if torch.isnan(predictions).any() or torch.isinf(predictions).any():
+                    print("[WARNING] NaN or Inf detected in predictions (validation).")
+                    print(f"predictions shape: {predictions.shape}")
+                    print(f"images shape: {images.shape}")
+                    print(f"padded_tokens shape: {padded_tokens.shape}")
+                    print(f"seq_len: {seq_len}")
+                    raise RuntimeError(f"Sanity check failed: NaN or Inf in predictions (validation, shape: {predictions.shape})")
+                targets = padded_tokens[:, 1:].reshape(-1)
+                if torch.isnan(targets.float()).any() or torch.isinf(targets.float()).any():
+                    print("[WARNING] NaN or Inf detected in targets (validation).")
+                    print(f"targets shape: {targets.shape}")
+                    raise RuntimeError(f"Sanity check failed: NaN or Inf in targets (validation, shape: {targets.shape})")
+                print(f"[Sanity][Val] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+                if seq_len <= 0:
+                    print("[WARNING] seq_len is not greater than zero after fix (validation).")
+                    raise RuntimeError(f"Sanity check failed: seq_len <= 0 (validation, seq_len: {seq_len})")
+                print(f"[Sanity][Val] seq_len: {seq_len}")
+                if padded_tokens[:, :-1].shape[1] != seq_len or padded_tokens[:, 1:].shape[1] != seq_len:
+                    print("[WARNING] padded_tokens slicing shapes are invalid (validation).")
+                    print(f"padded_tokens[:, :-1].shape: {padded_tokens[:, :-1].shape}")
+                    print(f"padded_tokens[:, 1:].shape: {padded_tokens[:, 1:].shape}")
+                    raise RuntimeError(f"Sanity check failed: Invalid shapes for padded_tokens slices (validation, got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
+
+                # Additional check: print unique target tokens before loss calculation
+                unique_targets = torch.unique(targets)
+                print(f"[Sanity][Val] Unique target tokens before loss: {unique_targets.tolist()}")
+                # Additional check: check for extreme values in predictions
+                if (predictions > 1e4).any() or (predictions < -1e4).any():
+                    print("[ERROR][Val] Extreme value detected in predictions (>1e4 or <-1e4).")
+                    print(f"Max prediction: {predictions.max().item()}, Min prediction: {predictions.min().item()}")
+                    raise RuntimeError("Sanity check failed: Extreme value in predictions (>1e4 or <-1e4) in validation.")
 
                 predictions_accum.append(predictions.cpu())
 
-                targets = padded_tokens[:, 1:].reshape(-1)
                 preds = predictions.reshape(-1, predictions.size(-1))
 
                 loss = criterion(preds, targets)
@@ -369,36 +315,6 @@ def create():
 
         avg_val_loss = val_loss / len(val_loader)
         print(f'Epoch {epoch+1}/{n_epochs}, Validation Loss: {avg_val_loss:.4f}')
-
-        # --- Structure-aware semantic validation logging ---
-        # Only on first epoch or every epoch, as desired
-        # Pad predictions so all have the same sequence length
-        from torch.nn.functional import pad
-        max_seq_len = max(p.shape[1] for p in predictions_accum)
-        for i in range(len(predictions_accum)):
-            seq_len = predictions_accum[i].shape[1]
-            if seq_len < max_seq_len:
-                pad_len = max_seq_len - seq_len
-                predictions_accum[i] = pad(predictions_accum[i], (0, 0, 0, pad_len))
-        all_preds = torch.cat(predictions_accum, dim=0)
-        decoded_preds = decode_predictions(all_preds, tokenizer)
-        print('Structure-aware validation (first 5 predictions):')
-        for pred in decoded_preds[:5]:  # just first few examples
-            valid, parsed = validate_math_expression(pred)
-            print(f'Raw: {pred} | Valid: {valid} | Parsed Tree: {parsed}')
-
-        # Structure-aware accuracy using SymPy parsing and comparison
-        structure_match_count = 0
-        total = len(decoded_preds)
-        for pred_str, gt_tokens in zip(decoded_preds, padded_tokens):
-            gt_str = tokenizer.decode(gt_tokens.tolist())
-            if expressions_match(pred_str, gt_str):
-                structure_match_count += 1
-        structure_accuracy = structure_match_count / total
-        print(f'Structure-aware Accuracy: {structure_accuracy:.4f}')
-
-        # Optional: Add sequence-level evaluation metric here (e.g., BLEU or edit distance) for future improvement
-        # e.g., compute BLEU between decoded_preds and ground truth sequences
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -414,6 +330,78 @@ def create():
             if epochs_no_improve >= patience:
                 print(f'Early stopping triggered at epoch {epoch+1}')
                 break
+
+    # After early stopping or last epoch
+    print("Training done! Running test set evaluation...")
+    test(encoder, decoder, test_loader)
+
+
+# Add test() function below create()
+def test(encoder, decoder, dataloader):
+    encoder.eval()
+    decoder.eval()
+    predictions_accum = []
+    with torch.no_grad():
+        for images, padded_tokens, lengths, type_ids, latex_strs in dataloader:
+            for i, latex in enumerate(latex_strs):
+                print(f"[Test] Sample {i} LaTeX: {latex} | Token length: {lengths[i]}")
+            images = images.to(device)
+            padded_tokens = padded_tokens.to(device)
+            lengths = torch.tensor(lengths).to(device)
+            type_ids = type_ids.to(device)
+
+            encoder_out = encoder(images, type_ids=type_ids)
+
+            seq_len = padded_tokens.size(1) - 1
+            if seq_len <= 0:
+                print("[WARNING] Zero or negative sequence length encountered in test. Applying zero-length padding fix.")
+                padded_tokens = torch.cat(
+                    [padded_tokens,
+                     torch.full((padded_tokens.size(0), 1), tokenizer.pad_token_id, device=padded_tokens.device)],
+                    dim=1
+                )
+                seq_len = padded_tokens.size(1) - 1
+            tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
+
+            predictions = decoder(encoder_out, padded_tokens[:, :-1], tgt_mask=tgt_mask)
+
+            # --- SANITY CHECKS (Test) ---
+            if torch.isnan(predictions).any() or torch.isinf(predictions).any():
+                print("[WARNING] NaN or Inf detected in predictions (test).")
+                print(f"predictions shape: {predictions.shape}")
+                print(f"images shape: {images.shape}")
+                print(f"padded_tokens shape: {padded_tokens.shape}")
+                print(f"seq_len: {seq_len}")
+                raise RuntimeError(f"Sanity check failed: NaN or Inf in predictions (test, shape: {predictions.shape})")
+            targets = padded_tokens[:, 1:].reshape(-1)
+            if torch.isnan(targets.float()).any() or torch.isinf(targets.float()).any():
+                print("[WARNING] NaN or Inf detected in targets (test).")
+                print(f"targets shape: {targets.shape}")
+                raise RuntimeError(f"Sanity check failed: NaN or Inf in targets (test, shape: {targets.shape})")
+            print(f"[Sanity][Test] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+            if seq_len <= 0:
+                print("[WARNING] seq_len is not greater than zero after fix (test).")
+                raise RuntimeError(f"Sanity check failed: seq_len <= 0 (test, seq_len: {seq_len})")
+            print(f"[Sanity][Test] seq_len: {seq_len}")
+            if padded_tokens[:, :-1].shape[1] != seq_len or padded_tokens[:, 1:].shape[1] != seq_len:
+                print("[WARNING] padded_tokens slicing shapes are invalid (test).")
+                print(f"padded_tokens[:, :-1].shape: {padded_tokens[:, :-1].shape}")
+                print(f"padded_tokens[:, 1:].shape: {padded_tokens[:, 1:].shape}")
+                raise RuntimeError(f"Sanity check failed: Invalid shapes for padded_tokens slices (test, got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
+
+            # Additional check: print unique target tokens before further processing
+            unique_targets = torch.unique(targets)
+            print(f"[Sanity][Test] Unique target tokens: {unique_targets.tolist()}")
+            # Additional check: check for extreme values in predictions
+            if (predictions > 1e4).any() or (predictions < -1e4).any():
+                print("[ERROR][Test] Extreme value detected in predictions (>1e4 or <-1e4).")
+                print(f"Max prediction: {predictions.max().item()}, Min prediction: {predictions.min().item()}")
+                raise RuntimeError("Sanity check failed: Extreme value in predictions (>1e4 or <-1e4) in test.")
+
+            predictions_accum.append(predictions.cpu())
+
+    all_preds = torch.cat(predictions_accum, dim=0)
+    decoded_preds = decode_predictions(all_preds, tokenizer)
 
 if __name__ == '__main__':
     create()
