@@ -1,7 +1,3 @@
-# Things to sort out:
-# why vit_base_patch16_256? does this rlly work in this use case?
-
-
 import json
 import torch
 import torch.optim as optim
@@ -11,6 +7,7 @@ from transformers import CLIPModel
 from torch import nn
 from dataset import MathDataset
 from latex_tokenizer import LatexTokenizer
+from tree_utils import to_tree, to_latex, clean_latex
 
 BATCH_SIZE = 4
 CORES = 1
@@ -20,6 +17,7 @@ PT_SAVE = 'graphite.pt'
 TRAIN_JSON = './datasets/train.json'
 TEST_JSON = './datasets/test.json'
 VAL_JSON = './datasets/val.json'
+
 
 def collate_fn(batch):
     # Unpack batch: (img, tokens, type_id)
@@ -33,6 +31,7 @@ def collate_fn(batch):
         padded_tokens_[j, :end] = tokens if isinstance(tokens, torch.Tensor) else torch.tensor(tokens, dtype=torch.long)
     type_ids_tensor = torch.tensor(type_ids, dtype=torch.long)
     return imgs, padded_tokens_, lengths, type_ids_tensor, latex_strs
+
 
 class EncoderViT(nn.Module):
     def __init__(self, output_dim=256, model_name='openai/clip-vit-large-patch14'):
@@ -62,6 +61,7 @@ class EncoderViT(nn.Module):
         x = self.proj(last_hidden)
         return x
 
+
 class TamerDecoder(nn.Module):
     def __init__(self, vocab_size, embed_dim=256, dropout=0.1, max_len=256):
         super().__init__()
@@ -79,6 +79,7 @@ class TamerDecoder(nn.Module):
         logits = self.fc(x)
         return logits
 
+
 with open(TRAIN_JSON, 'r', encoding='utf-8') as f:
     train_data = json.load(f)
 
@@ -92,14 +93,50 @@ train_latex = [pair['latex'] for pair in train_data['pairs'] if pair.get('latex'
 val_latex = [pair['latex'] for pair in val_data['pairs'] if pair.get('latex') is not None]
 test_latex = [pair['latex'] for pair in test_data['pairs'] if pair.get('latex') is not None]
 
-all_latex = train_latex + val_latex + test_latex
-
 tokenizer = LatexTokenizer()
-tokenizer.build_vocab(all_latex)
 
-train_dataset = MathDataset(TRAIN_JSON, tokenizer)
-val_dataset = MathDataset(VAL_JSON, tokenizer)
-test_dataset = MathDataset(TEST_JSON, tokenizer)
+
+def safe_to_tree(latex, show_success=False):
+    try:
+        result = to_tree(latex)
+        if show_success:
+            print(f"[SUCCESS] Successfully parsed LaTeX: {latex[:50]}...")
+        return result
+    except Exception as e:
+        print(f"[FAILED] Failed to parse LaTeX: {latex[:50]}... | Error: {str(e)[:100]}")
+        return None
+
+
+def safe_to_latex(sequence):
+    try:
+        return to_latex(sequence)
+    except Exception as e:
+        print(f"[WARNING] Failed to convert sequence to LaTeX, using fallback")
+        return ""
+
+
+def safe_clean_latex(latex):
+    try:
+        return clean_latex(latex)
+    except Exception as e:
+        print(f"[WARNING] Failed to clean LaTeX, using original: {latex[:50]}...")
+        return latex
+
+
+# Filter out None values (failed parses)
+train_sequences = [seq for seq in [safe_to_tree(latex) for latex in train_latex] if seq is not None]
+val_sequences = [seq for seq in [safe_to_tree(latex) for latex in val_latex] if seq is not None]
+test_sequences = [seq for seq in [safe_to_tree(latex) for latex in test_latex] if seq is not None]
+
+print(
+    f"Successfully parsed: Train={len(train_sequences)}/{len(train_latex)}, Val={len(val_sequences)}/{len(val_latex)}, Test={len(test_sequences)}/{len(test_latex)}")
+
+tokenizer.build_vocab(train_sequences + val_sequences + test_sequences)
+
+# Create datasets with safe parsing
+train_dataset = MathDataset(TRAIN_JSON, tokenizer, parse_func=lambda x: safe_to_tree(x))
+val_dataset = MathDataset(VAL_JSON, tokenizer, parse_func=lambda x: safe_to_tree(x))
+test_dataset = MathDataset(TEST_JSON, tokenizer, parse_func=lambda x: safe_to_tree(x))
 
 # Build encoder and decoder
 encoder = EncoderViT(output_dim=256)
@@ -122,17 +159,27 @@ optimizer = optim.Adam(
     lr=1e-6
 )
 
+
 def decode_predictions(preds, tokenizer):
     pred_tokens = preds.argmax(dim=-1)
-    decoded = [tokenizer.decode(seq.tolist()) for seq in pred_tokens]
-    # TIP: You can add a sanity check here to compare decoded output with valid LaTeX via sympy
+    decoded = []
+    for seq in pred_tokens:
+        try:
+            latex_str = safe_to_latex(tokenizer.decode(seq.tolist()))
+            cleaned = safe_clean_latex(latex_str)
+            decoded.append(cleaned)
+        except Exception as e:
+            print(f"[WARNING] Failed to decode prediction, using empty string")
+            decoded.append("")
     return decoded
+
 
 def create():
     print('Getting started...')
 
     train_loader = DataLoader(
-        train_dataset, collate_fn=collate_fn, num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn,
+        num_workers=CORES, pin_memory=True, persistent_workers=True, prefetch_factor=8
     )
 
     val_loader = DataLoader(
@@ -155,14 +202,21 @@ def create():
     patience = 7
 
     for epoch in range(n_epochs):
-        print(f'Running epoch {epoch+1}/{n_epochs}')
+        print(f'Running epoch {epoch + 1}/{n_epochs}')
         encoder.train()
         decoder.train()
         running_loss = 0.0
+
         # Training loop: extract type_ids from batch and pass to encoder
         for images, padded_tokens, lengths, type_ids, latex_strs in tqdm(train_loader):
+            # Skip batch if any sample failed to parse
+            if any(length == 0 for length in lengths):
+                print("[WARNING] Skipping batch with failed parsing")
+                continue
+
             for i, latex in enumerate(latex_strs):
-                print(f"Sample {i} LaTeX: {latex} | Token length: {lengths[i]}")
+                print(f"Sample {i} LaTeX: {safe_clean_latex(latex)} | Token length: {lengths[i]}")
+
             images = images.to(device, non_blocking=True)
             padded_tokens = padded_tokens.to(device, non_blocking=True)
             lengths = torch.tensor(lengths).to(device, non_blocking=True)
@@ -202,7 +256,8 @@ def create():
                     print(f"targets shape: {targets.shape}")
                     raise RuntimeError(f"Sanity check failed: NaN or Inf in targets (shape: {targets.shape})")
                 # Print shapes
-                print(f"[Sanity] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+                print(
+                    f"[Sanity] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
                 # Check seq_len
                 if seq_len <= 0:
                     print("[WARNING] seq_len is not greater than zero after fix.")
@@ -213,7 +268,8 @@ def create():
                     print("[WARNING] padded_tokens slicing shapes are invalid.")
                     print(f"padded_tokens[:, :-1].shape: {padded_tokens[:, :-1].shape}")
                     print(f"padded_tokens[:, 1:].shape: {padded_tokens[:, 1:].shape}")
-                    raise RuntimeError(f"Sanity check failed: Invalid shapes for padded_tokens slices (got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
+                    raise RuntimeError(
+                        f"Sanity check failed: Invalid shapes for padded_tokens slices (got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
 
                 # Additional check: print unique target tokens before loss calculation
                 unique_targets = torch.unique(targets)
@@ -242,7 +298,7 @@ def create():
             running_loss += decoder_loss.item()
 
         avg_train_loss = running_loss / len(train_loader)
-        print(f'Epoch {epoch+1}/{n_epochs}, Train Loss: {avg_train_loss:.4f}')
+        print(f'Epoch {epoch + 1}/{n_epochs}, Train Loss: {avg_train_loss:.4f}')
 
         # Validation
         encoder.eval()
@@ -250,9 +306,14 @@ def create():
         val_loss = 0.0
         predictions_accum = []
         with torch.no_grad():
-            for images, padded_tokens, lengths, type_ids, latex_strs in tqdm(train_loader):
+            for images, padded_tokens, lengths, type_ids, latex_strs in tqdm(val_loader):
+                # Skip batch if any sample failed to parse
+                if any(length == 0 for length in lengths):
+                    print("[WARNING] Skipping validation batch with failed parsing")
+                    continue
+
                 for i, latex in enumerate(latex_strs):
-                    print(f"[VAL] Sample {i} LaTeX: {latex} | Token length: {lengths[i]}")
+                    print(f"[VAL] Sample {i} LaTeX: {safe_clean_latex(latex)} | Token length: {lengths[i]}")
                 images = images.to(device)
                 padded_tokens = padded_tokens.to(device)
                 lengths = torch.tensor(lengths).to(device)
@@ -263,7 +324,8 @@ def create():
 
                 seq_len = padded_tokens.size(1) - 1
                 if seq_len <= 0:
-                    print("[WARNING] Zero or negative sequence length encountered in validation. Applying zero-length padding fix.")
+                    print(
+                        "[WARNING] Zero or negative sequence length encountered in validation. Applying zero-length padding fix.")
                     padded_tokens = torch.cat(
                         [padded_tokens,
                          torch.full((padded_tokens.size(0), 1), tokenizer.pad_token_id, device=padded_tokens.device)],
@@ -280,13 +342,16 @@ def create():
                     print(f"images shape: {images.shape}")
                     print(f"padded_tokens shape: {padded_tokens.shape}")
                     print(f"seq_len: {seq_len}")
-                    raise RuntimeError(f"Sanity check failed: NaN or Inf in predictions (validation, shape: {predictions.shape})")
+                    raise RuntimeError(
+                        f"Sanity check failed: NaN or Inf in predictions (validation, shape: {predictions.shape})")
                 targets = padded_tokens[:, 1:].reshape(-1)
                 if torch.isnan(targets.float()).any() or torch.isinf(targets.float()).any():
                     print("[WARNING] NaN or Inf detected in targets (validation).")
                     print(f"targets shape: {targets.shape}")
-                    raise RuntimeError(f"Sanity check failed: NaN or Inf in targets (validation, shape: {targets.shape})")
-                print(f"[Sanity][Val] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+                    raise RuntimeError(
+                        f"Sanity check failed: NaN or Inf in targets (validation, shape: {targets.shape})")
+                print(
+                    f"[Sanity][Val] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
                 if seq_len <= 0:
                     print("[WARNING] seq_len is not greater than zero after fix (validation).")
                     raise RuntimeError(f"Sanity check failed: seq_len <= 0 (validation, seq_len: {seq_len})")
@@ -295,7 +360,8 @@ def create():
                     print("[WARNING] padded_tokens slicing shapes are invalid (validation).")
                     print(f"padded_tokens[:, :-1].shape: {padded_tokens[:, :-1].shape}")
                     print(f"padded_tokens[:, 1:].shape: {padded_tokens[:, 1:].shape}")
-                    raise RuntimeError(f"Sanity check failed: Invalid shapes for padded_tokens slices (validation, got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
+                    raise RuntimeError(
+                        f"Sanity check failed: Invalid shapes for padded_tokens slices (validation, got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
 
                 # Additional check: print unique target tokens before loss calculation
                 unique_targets = torch.unique(targets)
@@ -304,7 +370,8 @@ def create():
                 if (predictions > 1e4).any() or (predictions < -1e4).any():
                     print("[ERROR][Val] Extreme value detected in predictions (>1e4 or <-1e4).")
                     print(f"Max prediction: {predictions.max().item()}, Min prediction: {predictions.min().item()}")
-                    raise RuntimeError("Sanity check failed: Extreme value in predictions (>1e4 or <-1e4) in validation.")
+                    raise RuntimeError(
+                        "Sanity check failed: Extreme value in predictions (>1e4 or <-1e4) in validation.")
 
                 predictions_accum.append(predictions.cpu())
 
@@ -314,7 +381,7 @@ def create():
                 val_loss += loss.item()
 
         avg_val_loss = val_loss / len(val_loader)
-        print(f'Epoch {epoch+1}/{n_epochs}, Validation Loss: {avg_val_loss:.4f}')
+        print(f'Epoch {epoch + 1}/{n_epochs}, Validation Loss: {avg_val_loss:.4f}')
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -328,7 +395,7 @@ def create():
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f'Early stopping triggered at epoch {epoch+1}')
+                print(f'Early stopping triggered at epoch {epoch + 1}')
                 break
 
     # After early stopping or last epoch
@@ -343,8 +410,13 @@ def test(encoder, decoder, dataloader):
     predictions_accum = []
     with torch.no_grad():
         for images, padded_tokens, lengths, type_ids, latex_strs in dataloader:
+            # Skip batch if any sample failed to parse
+            if any(length == 0 for length in lengths):
+                print("[WARNING] Skipping test batch with failed parsing")
+                continue
+
             for i, latex in enumerate(latex_strs):
-                print(f"[Test] Sample {i} LaTeX: {latex} | Token length: {lengths[i]}")
+                print(f"[Test] Sample {i} LaTeX: {safe_clean_latex(latex)} | Token length: {lengths[i]}")
             images = images.to(device)
             padded_tokens = padded_tokens.to(device)
             lengths = torch.tensor(lengths).to(device)
@@ -354,7 +426,8 @@ def test(encoder, decoder, dataloader):
 
             seq_len = padded_tokens.size(1) - 1
             if seq_len <= 0:
-                print("[WARNING] Zero or negative sequence length encountered in test. Applying zero-length padding fix.")
+                print(
+                    "[WARNING] Zero or negative sequence length encountered in test. Applying zero-length padding fix.")
                 padded_tokens = torch.cat(
                     [padded_tokens,
                      torch.full((padded_tokens.size(0), 1), tokenizer.pad_token_id, device=padded_tokens.device)],
@@ -378,7 +451,8 @@ def test(encoder, decoder, dataloader):
                 print("[WARNING] NaN or Inf detected in targets (test).")
                 print(f"targets shape: {targets.shape}")
                 raise RuntimeError(f"Sanity check failed: NaN or Inf in targets (test, shape: {targets.shape})")
-            print(f"[Sanity][Test] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
+            print(
+                f"[Sanity][Test] images shape: {images.shape}, padded_tokens shape: {padded_tokens.shape}, predictions shape: {predictions.shape}, targets shape: {targets.shape}")
             if seq_len <= 0:
                 print("[WARNING] seq_len is not greater than zero after fix (test).")
                 raise RuntimeError(f"Sanity check failed: seq_len <= 0 (test, seq_len: {seq_len})")
@@ -387,7 +461,8 @@ def test(encoder, decoder, dataloader):
                 print("[WARNING] padded_tokens slicing shapes are invalid (test).")
                 print(f"padded_tokens[:, :-1].shape: {padded_tokens[:, :-1].shape}")
                 print(f"padded_tokens[:, 1:].shape: {padded_tokens[:, 1:].shape}")
-                raise RuntimeError(f"Sanity check failed: Invalid shapes for padded_tokens slices (test, got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
+                raise RuntimeError(
+                    f"Sanity check failed: Invalid shapes for padded_tokens slices (test, got {padded_tokens[:, :-1].shape} and {padded_tokens[:, 1:].shape}, expected seq_len={seq_len})")
 
             # Additional check: print unique target tokens before further processing
             unique_targets = torch.unique(targets)
@@ -402,6 +477,7 @@ def test(encoder, decoder, dataloader):
 
     all_preds = torch.cat(predictions_accum, dim=0)
     decoded_preds = decode_predictions(all_preds, tokenizer)
+
 
 if __name__ == '__main__':
     create()

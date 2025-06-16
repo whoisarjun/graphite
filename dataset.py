@@ -2,11 +2,11 @@ import torch
 import json
 import torchvision.transforms as T
 from torch.utils.data import Dataset
-from tree_utils import latex_to_sympy_tree, serialize_tree, flatten_tree_serialized
+# Removed tree_utils import
 from PIL import Image
 
 class MathDataset(Dataset):
-    def __init__(self, json_path, tokenizer, transform=None):
+    def __init__(self, json_path, tokenizer, transform=None, parse_func=None):
         with open(json_path, 'r', encoding='utf-8') as f:
             json_data = json.load(f)
             self.data = [
@@ -20,6 +20,7 @@ class MathDataset(Dataset):
             T.ToTensor(),
             T.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
         ])
+        self.parse_func = parse_func
 
     def get_type(self, idx):
         return self.data[idx].get("type", "unknown")
@@ -40,20 +41,13 @@ class MathDataset(Dataset):
         type_str = self.get_type(idx)
         type_id = 0 if type_str == 'symbol' else 1
 
-        if type_id == 1:  # complete mode
-            latex_str = self.data[idx]['latex']
-            tree = latex_to_sympy_tree(latex_str)
-            if tree is None:
-                tree_seq = ['<UNK>']
-            else:
-                serialized = serialize_tree(tree)
-                tree_seq = flatten_tree_serialized(serialized)
-            token_ids = [self.tokenizer.token_to_id.get(tok, self.tokenizer.token_to_id['<UNK>']) for tok in tree_seq]
-            tokens = torch.tensor(token_ids, dtype=torch.long)
+        latex_str = self.data[idx]['latex']
+        if self.parse_func:
+            parsed = self.parse_func(latex_str)
         else:
-            latex_str = self.data[idx]['latex']
-            tokens_list = self.tokenizer.encode(latex_str)
-            token_ids = [self.tokenizer.token_to_id.get(tok, self.tokenizer.token_to_id['<UNK>']) for tok in tokens_list]
-            tokens = torch.tensor(token_ids, dtype=torch.long)
+            parsed = latex_str
+        tokens_list = self.tokenizer.encode(parsed)
+        token_ids = [self.tokenizer.token_to_id.get(tok, self.tokenizer.token_to_id['<UNK>']) for tok in tokens_list]
+        tokens = torch.tensor(token_ids, dtype=torch.long)
 
         return image, tokens, type_id, latex_str
