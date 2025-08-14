@@ -3,18 +3,22 @@ import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split, Sampler
 from torch import nn
-from dataset import MathDataset
-from latex_tokenizer import LatexTokenizer
+from .dataset import MathDataset
+from .latex_tokenizer import LatexTokenizer
 from sympy.parsing.latex import parse_latex
 from sympy.core.sympify import SympifyError
 from tqdm import tqdm
 from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
 import timm
+from .latex_list import lst
+import os
 
 BATCH_SIZE = 16
 CORES = 16
 TOTAL_EPOCHS = 25
-JSON_PATH = 'datasets/val.json'
+import os
+
+JSON_PATH = os.path.join(os.path.dirname(__file__), 'empty.json')
 PT_SAVE = 'graphite_test_val.pt'
 
 def collate_fn(batch):
@@ -112,12 +116,8 @@ class TransformerDecoder(nn.Module):
         logits = self.fc(output)
         return logits
 
-with open(JSON_PATH, 'r', encoding='utf-8') as f:
-    raw_data = json.load(f)
-latex_list = [pair['latex'] for pair in raw_data['pairs'] if pair.get('latex') is not None]
-
 tokenizer = LatexTokenizer()
-tokenizer.build_vocab(latex_list)
+tokenizer.build_vocab(lst)
 
 class MathDatasetWithType(MathDataset):
     """

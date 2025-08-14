@@ -8,12 +8,26 @@ warnings.filterwarnings(
 )
 
 import torch
+import os
 import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
-from create_model import TransformerDecoder, LatexTokenizer  # adjust imports if needed
+from .create_model import TransformerDecoder, LatexTokenizer  # adjust imports if needed
 
 import re
+
+import torch
+import requests
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "graphite.pt")
+MODEL_URL = "https://huggingface.co/whoisarjun/graphite/resolve/main/graphite.pt"
+
+if not os.path.exists(MODEL_PATH):
+    print("Downloading model...")
+    r = requests.get(MODEL_URL, stream=True)
+    with open(MODEL_PATH, "wb") as f:
+        for chunk in r.iter_content(chunk_size=8192):
+            f.write(chunk)
 
 def clean_latex(raw_latex: str) -> str:
     replacements = {
@@ -57,7 +71,7 @@ def clean_latex(raw_latex: str) -> str:
     return raw_latex
 
 class Graphite:
-    def __init__(self, model_path='graphite.pt', device=None):
+    def __init__(self, model_path=MODEL_PATH, device=None):
         self.device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
 
         checkpoint = torch.load(model_path, map_location=self.device)
@@ -69,7 +83,7 @@ class Graphite:
 
         vocab_size = len(tokenizer_vocab)
 
-        from create_model import EncoderViT
+        from .create_model import EncoderViT
         self.encoder = EncoderViT(output_dim=256).to(self.device)
         self.decoder = TransformerDecoder(
             vocab_size=vocab_size,

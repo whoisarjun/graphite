@@ -13,9 +13,13 @@ CLEANED_DATA_TEST/
 8TH_BATCH_SYMBOLS/
 9TH_BATCH_SYMBOLS/
 10TH_BATCH_SYMBOLS/
+archived/pairs_archive.json
 
 # Folder stuff
 /.venv
 /.idea
 /__pycache__
 .DS_Store
+
+# Other useless files
+latex_tags.txt

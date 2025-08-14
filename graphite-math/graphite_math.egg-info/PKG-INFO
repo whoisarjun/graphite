@@ -1,0 +1,24 @@
+Metadata-Version: 2.4
+Name: graphite-math
+Version: 0.1.14
+Summary: Math OCR that generates LaTeX from handwritten math
+Author: Arjun Palakkal
+License: MIT
+Project-URL: Homepage, https://github.com/whoisarjun/graphite
+Requires-Python: >=3.7
+Description-Content-Type: text/markdown
+License-File: LICENSE.txt
+Requires-Dist: torch>=2.7.0
+Requires-Dist: torchvision>=0.22.0
+Requires-Dist: pillow>=11.2.1
+Requires-Dist: numpy>=2.2.6
+Requires-Dist: scipy>=1.15.3
+Requires-Dist: tqdm>=4.67.1
+Requires-Dist: sympy>=1.14.0
+Requires-Dist: timm>=0.5.4
+Requires-Dist: matplotlib>=3.10.3
+Requires-Dist: scikit-image>=0.25.2
+Requires-Dist: transformers>=4.52.4
+Requires-Dist: editdistance>=0.8.1
+Requires-Dist: scikit-learn>=1.7.0
+Dynamic: license-file
