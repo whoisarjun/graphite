@@ -2,7 +2,7 @@ import re
 import torch
 
 def _tokenize(latex):
-    latex = latex.strip('$')
+    latex = ' '.join(latex).strip('$')
     pattern = r'(\\[a-zA-Z]+|\\.|[0-9]+|[{}_^()\[\]=+\-*/]|[a-zA-Z]|[^ \t\n])'
     return re.findall(pattern, latex)
 
